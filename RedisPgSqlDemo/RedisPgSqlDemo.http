@@ -1,0 +1,6 @@
+@RedisPgSqlDemo_HostAddress = http://localhost:5057
+
+GET {{RedisPgSqlDemo_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
