@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Distributed;
 using RedisPgSqlDemo.Data;
 using RedisPgSqlDemo.Models;
+using RedisPgSqlDemo.Services;
 using System.Text.Json;
 
 namespace RedisPgSqlDemo.Controllers;
@@ -11,23 +12,26 @@ namespace RedisPgSqlDemo.Controllers;
 [ApiController]
 public class ClientsController : ControllerBase
 {
-    private readonly AppDbContext _context;
-    private readonly IHttpClientFactory _httpClientFactory; // Used to interface with Redis via IDistributedCache
+    private readonly IShardedDbContextFactory _contextFactory;
     private readonly IDistributedCache _cache;
+    private readonly IShardingService _shardingService;
     private readonly ILogger<ClientsController> _logger;
 
-    public ClientsController(AppDbContext context, IDistributedCache cache, ILogger<ClientsController> logger)
+    public ClientsController(IShardedDbContextFactory contextFactory,
+                             IDistributedCache cache,
+                             IShardingService shardingService,
+                             ILogger<ClientsController> logger)
     {
-        _context = context;
+        _contextFactory = contextFactory;
         _cache = cache;
+        _shardingService = shardingService;
         _logger = logger;
     }
 
-    // GET: api/clients/5
+    // GET: api/clients/{id}
     [HttpGet("{id}")]
-    public async Task<ActionResult<Client>> GetClient(int id)
+    public async Task<ActionResult<Client>> GetClient(Guid id)
     {
-        // 1. Пробуем прочитать из кэша
         var cacheKey = $"client_{id}";
         var cachedClient = await _cache.GetStringAsync(cacheKey);
 
@@ -37,17 +41,21 @@ public class ClientsController : ControllerBase
             return Ok(JsonSerializer.Deserialize<Client>(cachedClient));
         }
 
-        // 2. При промахе читаем из БД
-        var client = await _context.Clients.FindAsync(id);
+        // Определяем шард, на котором находится клиент
+        using var context = _contextFactory.CreateContext(id);
+
+        var client = await context.Clients.FindAsync(id);
 
         if (client == null)
         {
             return NotFound();
         }
 
-        // 3. Сохраняем в кэш (Write-Behind / Lazy Loading )
+        // Заполняем информацию о секции
+        client.SetSectionInfo(_shardingService.GetSectionIndex(id));
+
         await _cache.SetStringAsync(cacheKey, JsonSerializer.Serialize(client));
-        _logger.LogInformation("Cached client {Id}", id);
+        _logger.LogInformation("Retrieved client {Id} from Shard {Shard}", id, _shardingService.GetShardIndex(id));
 
         return Ok(client);
     }
@@ -56,72 +64,80 @@ public class ClientsController : ControllerBase
     [HttpPost]
     public async Task<ActionResult<Client>> CreateClient(Client client)
     {
-        _context.Clients.Add(client);
-        await _context.SaveChangesAsync();
+        // Генерируем ID, если клиент его не прислал
+        if (client.Id == Guid.Empty)
+        {
+            client.Id = Guid.NewGuid();
+        }
 
-        // Write-Through: Обновляем кэш сразу после записи в БД
+        // Определяем целевой шард
+        var shardIndex = _shardingService.GetShardIndex(client.Id);
+        var sectionIndex = _shardingService.GetSectionIndex(client.Id);
+
+        _logger.LogInformation("Creating client {Id} in Section {Section} on Shard {Shard}", client.Id, sectionIndex, shardIndex);
+
+        // Соединяемся с нужным шардом
+        using var context = _contextFactory.CreateContext(client.Id);
+
+        context.Clients.Add(client);
+        await context.SaveChangesAsync();
+
+        // Write-Through Cache
+        client.SetSectionInfo(sectionIndex);
         var cacheKey = $"client_{client.Id}";
         await _cache.SetStringAsync(cacheKey, JsonSerializer.Serialize(client));
 
         return CreatedAtAction(nameof(GetClient), new { id = client.Id }, client);
     }
 
-    // PUT: api/clients/5
+    // PUT: api/clients/{id}
     [HttpPut("{id}")]
-    public async Task<IActionResult> UpdateClient(int id, Client client)
+    public async Task<IActionResult> UpdateClient(Guid id, Client client)
     {
-        if (id != client.Id)
-        {
-            return BadRequest();
-        }
+        if (id != client.Id) return BadRequest();
 
-        _context.Entry(client).State = EntityState.Modified;
+        using var context = _contextFactory.CreateContext(id);
+
+        context.Entry(client).State = EntityState.Modified;
 
         try
         {
-            await _context.SaveChangesAsync();
+            await context.SaveChangesAsync();
         }
         catch (DbUpdateConcurrencyException)
         {
-            if (!ClientExists(id))
-            {
-                return NotFound();
-            }
-            else
-            {
-                throw;
-            }
+            // Проверяем существование на конкретном шарде
+            if (!await ClientExists(id, context)) return NotFound();
+            else throw;
         }
 
-        // Write-Through: Обновляем кэш сразу после записи в БД
-        var cacheKey = $"client_{client.Id}";
+        // Write-Through Cache
+        var cacheKey = $"client_{id}";
         await _cache.SetStringAsync(cacheKey, JsonSerializer.Serialize(client));
 
         return NoContent();
     }
 
-    // DELETE: api/clients/5
+    // DELETE: api/clients/{id}
     [HttpDelete("{id}")]
-    public async Task<IActionResult> DeleteClient(int id)
+    public async Task<IActionResult> DeleteClient(Guid id)
     {
-        var client = await _context.Clients.FindAsync(id);
-        if (client == null)
-        {
-            return NotFound();
-        }
+        using var context = _contextFactory.CreateContext(id);
 
-        _context.Clients.Remove(client);
-        await _context.SaveChangesAsync();
+        var client = await context.Clients.FindAsync(id);
+        if (client == null) return NotFound();
 
-        // Write-Through: Удаляем элемент из кэша сразу после изменения в БД
+        context.Clients.Remove(client);
+        await context.SaveChangesAsync();
+
         var cacheKey = $"client_{id}";
         await _cache.RemoveAsync(cacheKey);
 
         return NoContent();
     }
 
-    private bool ClientExists(int id)
+    private async Task<bool> ClientExists(Guid id, AppDbContext context)
     {
-        return _context.Clients.Any(e => e.Id == id);
+        return await context.Clients.AnyAsync(e => e.Id == id);
     }
 }

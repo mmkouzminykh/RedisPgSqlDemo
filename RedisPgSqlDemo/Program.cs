@@ -1,18 +1,21 @@
 using Microsoft.EntityFrameworkCore;
 using RedisPgSqlDemo.Data;
+using RedisPgSqlDemo.Services;
+
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Add services to the container.
 
-// 1. Настроим PostgreSQL
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseNpgsql(builder.Configuration.GetConnectionString("PostgresConnection")));
+// Register Sharding Logic
+builder.Services.AddSingleton<IShardingService, ShardingService>();
+builder.Services.AddScoped<IShardedDbContextFactory, ShardedDbContextFactory>();
 
-// 2. Настроим Redis Distributed Cache
+// Configure Redis
 builder.Services.AddStackExchangeRedisCache(options =>
 {
     options.Configuration = builder.Configuration.GetConnectionString("RedisConnection");
-    options.InstanceName = "RedisPgSql_"; // Optional prefix for keys
+    options.InstanceName = "ShopApi_";
 });
 
 builder.Services.AddControllers();
@@ -28,16 +31,11 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-using (var scope = app.Services.CreateScope())
-{
-    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    db.Database.EnsureCreated(); // Для простоты, создаем БД, если её пока нет
-}
+// Инициализация БД
+// В реальной системе тут будут проверки и прогон скриптов миграции
+// Для простого примера мы предполагаем, что "shop_shard_0", "shop_shard_1", "shop_shard_2" существуют
 
 app.UseHttpsRedirection();
-
 app.UseAuthorization();
-
 app.MapControllers();
-
 app.Run();
