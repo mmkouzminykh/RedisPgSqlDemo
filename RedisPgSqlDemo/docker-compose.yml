@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  # First PostgreSQL Instance (Shard One)
+  shard-one:
+    image: postgres:16
+    container_name: postgres_shard_one
+    environment:
+      POSTGRES_USER: user_one
+      POSTGRES_PASSWORD: password_one
+      POSTGRES_DB: db_one
+    ports:
+      - "5433:5432"
+    volumes:
+      - ShardOne:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Second PostgreSQL Instance (Shard Two)
+  shard-two:
+    image: postgres:16
+    container_name: postgres_shard_two
+    environment:
+      POSTGRES_USER: user_two
+      POSTGRES_PASSWORD: password_two
+      POSTGRES_DB: db_two
+    ports:
+      - "5434:5432"
+    volumes:
+      - ShardTwo:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  ShardOne:
+    driver: local
+  ShardTwo:
+    driver: local
